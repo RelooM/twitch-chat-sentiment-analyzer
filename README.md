@@ -15,8 +15,9 @@ Real-time sentiment analysis tool for Twitch chat with **per-word** and **senten
   - Ignore specific words (`--ignore-words`)
   - Minimum word length (`--min-word-len`)
   - Minimum sentence length (`--min-sentence-words`)
-- **Ignores @mentions** automatically
-- **Deduplicates repeated words** within the same message
+  - **Toggle @mentions** (`--ignore-mentions` / `--no-ignore-mentions`)
+  - **Toggle chat commands** (`--ignore-commands` / `--no-ignore-commands`)
+- Deduplicates repeated words within the same message
 
 ## Installation
 
@@ -25,7 +26,7 @@ Real-time sentiment analysis tool for Twitch chat with **per-word** and **senten
 - Python 3.10+
 - `sentence-transformers`
 - `transformers`
-- `torch` (CPU or GPU)
+- `torch`
 
 ### Quick Start
 
@@ -50,16 +51,18 @@ python3 twitch_sentiment_tool.py \
   --token oauth:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ```
 
-### Advanced Usage
+### Advanced Usage with Toggles
 
 ```bash
 python3 twitch_sentiment_tool.py \
   --channel montanablack88 \
   --token oauth:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
-  --ignore-users bot1,bot2,streamlabs \
-  --ignore-words pog,gg,ez,lol,wtf \
+  --ignore-users bot1,bot2 \
+  --ignore-words pog,gg,ez \
   --min-word-len 4 \
-  --min-sentence-words 3
+  --min-sentence-words 3 \
+  --no-ignore-mentions \
+  --ignore-commands
 ```
 
 ## Command Line Options
@@ -72,28 +75,29 @@ python3 twitch_sentiment_tool.py \
 | `--ignore-words`          | —       | Comma-separated list of words to ignore          |
 | `--min-word-len`          | 3       | Minimum characters per word                      |
 | `--min-sentence-words`    | 2       | Minimum number of words in a message             |
+| `--ignore-mentions`       | True    | Ignore words starting with @                     |
+| `--no-ignore-mentions`    | —       | Disable @mention filtering                       |
+| `--ignore-commands`       | True    | Ignore messages starting with `!`                |
+| `--no-ignore-commands`    | —       | Disable command filtering                        |
 
 ## Output
 
 The tool displays two live-updating sections:
 
 ### Word Clusters
-Shows the top semantically similar words and their representative sentences.
+Top semantically grouped words with representative sentences.
 
 ### Similar Sentence Clusters
-Groups nearly identical or highly similar chat messages together (e.g., repeated hype messages, complaints about lag, etc.).
-
-Both views use **freshness-weighted scoring** so recent chat has more influence.
+Groups of nearly identical or highly similar chat messages (e.g. repeated hype, complaints, etc.).
 
 ## How It Works
 
 1. Connects to Twitch IRC
-2. Tokenizes every message
-3. Runs sentiment analysis on individual words
-4. Uses `sentence-transformers` embeddings to cluster:
-   - Similar words
-   - Similar full sentences
-5. Applies exponential decay (45s half-life) so newer messages rank higher
+2. Optionally filters @mentions and !commands
+3. Tokenizes messages with configurable minimum length
+4. Runs sentiment analysis on individual words
+5. Uses `sentence-transformers` to cluster both words and full sentences
+6. Applies exponential decay so recent chat ranks higher
 
 ## License
 
