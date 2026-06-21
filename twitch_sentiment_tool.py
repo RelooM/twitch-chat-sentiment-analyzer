@@ -2,10 +2,8 @@
 """
 Twitch Real-Time Chat Sentiment Analyzer v2
 - Per-word analysis + semantic embedding clustering
-- Sentence-level semantic clustering (focus on similar sentences)
-- Representative sentence per cluster
-- Freshness-weighted top 10 (words + sentences)
-- User / word ignore lists + configurable thresholds
+- Sentence-level semantic clustering
+- Toggleable @mention and !command filtering
 """
 
 import socket
@@ -37,11 +35,20 @@ print("[INFO] Models ready.\n")
 
 STOPWORDS = {"the","a","an","and","or","but","in","on","at","to","for","of","with","is","are","was","were","be","been","being","have","has","had","do","does","did","will","would","could","should","can","this","that","these","those","i","you","he","she","it","we","they","me","him","her","us","them","my","your","his","her","its","our","their","so","just","like","really","very","much","now","here","there","when","where","why","how","all","any","some","no","not","yes","yeah","lol","lmao","omg","wtf","gg","ez","pog","poggers","kappa","monka","pepe","feels","good","bad","nice","love","hate"}
 
-def tokenize_words(text, min_len=3, ignore_words=None):
+def tokenize_words(text, min_len=3, ignore_words=None, ignore_mentions=True):
     pattern = rf'\b[a-zA-Z]{{{min_len},}}\b'
     words = re.findall(pattern, text.lower())
     ignore_set = ignore_words or set()
-    return [w for w in words if w not in STOPWORDS and not w.startswith('@') and w not in ignore_set]
+    result = []
+    for w in words:
+        if w in STOPWORDS:
+            continue
+        if ignore_mentions and w.startswith('@'):
+            continue
+        if w in ignore_set:
+            continue
+        result.append(w)
+    return result
 
 def get_word_sentiment(word, sentence_score):
     try:
@@ -55,8 +62,8 @@ def get_word_sentiment(word, sentence_score):
 
 class SemanticSentimentTracker:
     def __init__(self, min_word_len=3, min_sentence_words=2, ignore_words=None):
-        self.clusters = []                    # word clusters
-        self.sentence_clusters = []           # sentence-level clusters
+        self.clusters = []
+        self.sentence_clusters = []
         self.lock = threading.Lock()
         self.message_count = 0
         self.min_word_len = min_word_len
@@ -66,9 +73,13 @@ class SemanticSentimentTracker:
     def _get_embedding(self, text):
         return embed_model.encode(text, convert_to_tensor=True, show_progress_bar=False)
 
-    def add_message(self, text, ts=None):
+    def add_message(self, text, ts=None, ignore_mentions=True, ignore_commands=True):
         if ts is None:
             ts = time.time()
+
+        # Skip command messages if enabled
+        if ignore_commands and text.strip().startswith('!'):
+            return
 
         try:
             sent_res = sentiment_pipeline(text[:512])[0]
@@ -78,7 +89,7 @@ class SemanticSentimentTracker:
         except:
             sent_score = 0.0
 
-        words = tokenize_words(text, self.min_word_len, self.ignore_words)
+        words = tokenize_words(text, self.min_word_len, self.ignore_words, ignore_mentions)
         if len(words) < self.min_sentence_words:
             return
         words = list(dict.fromkeys(words))
@@ -86,7 +97,7 @@ class SemanticSentimentTracker:
         with self.lock:
             self.message_count += 1
 
-            # === Word-level clustering ===
+            # Word-level clustering
             for word in words:
                 word_score = get_word_sentiment(word, sent_score)
                 emb = self._get_embedding(word)
@@ -111,7 +122,7 @@ class SemanticSentimentTracker:
                         "count": 1, "last_ts": ts, "members": [word], "best_sentence": text
                     })
 
-            # === Sentence-level clustering (new focus) ===
+            # Sentence-level clustering
             sent_emb = self._get_embedding(text)
             matched_sent = False
             for scluster in self.sentence_clusters:
@@ -134,7 +145,6 @@ class SemanticSentimentTracker:
                     "examples": [text]
                 })
 
-            # Prune old data
             cutoff = ts - SLIDING_WINDOW_SECONDS
             self.clusters = [c for c in self.clusters if c["last_ts"] >= cutoff]
             self.sentence_clusters = [c for c in self.sentence_clusters if c["last_ts"] >= cutoff]
@@ -185,7 +195,8 @@ class SemanticSentimentTracker:
         with self.lock:
             return self.message_count, len(self.clusters), len(self.sentence_clusters)
 
-def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_words, ignore_words):
+def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_words, ignore_words,
+                       ignore_mentions, ignore_commands):
     ignore_set = {u.lower().strip() for u in ignore_users} if ignore_users else set()
     ignore_word_set = {w.lower().strip() for w in ignore_words} if ignore_words else set()
 
@@ -203,6 +214,7 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
     print(f"[INFO] Joined #{channel}. Per-word + sentence-level semantic clustering active.")
     if ignore_set: print(f"[INFO] Ignoring users: {', '.join(ignore_set)}")
     if ignore_word_set: print(f"[INFO] Ignoring words: {', '.join(ignore_word_set)}")
+    print(f"[INFO] Ignore @mentions: {ignore_mentions} | Ignore !commands: {ignore_commands}")
     print(f"[INFO] Min word len: {min_word_len} | Min words/sentence: {min_sentence_words}\n")
 
     tracker = SemanticSentimentTracker(min_word_len, min_sentence_words, ignore_word_set)
@@ -257,7 +269,7 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
                     if user in ignore_set: continue
                     msg = match.group(2).strip()
                     if msg:
-                        tracker.add_message(msg)
+                        tracker.add_message(msg, ignore_mentions=ignore_mentions, ignore_commands=ignore_commands)
             if time.time() - last_ping > PING_INTERVAL:
                 sock.send("PING :tmi.twitch.tv\r\n".encode("utf-8"))
                 last_ping = time.time()
@@ -268,18 +280,31 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
         print("[INFO] Disconnected.")
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description="Twitch chat sentiment analyzer")
     parser.add_argument("--channel", required=True)
     parser.add_argument("--token", required=True)
     parser.add_argument("--ignore-users", default="")
     parser.add_argument("--ignore-words", default="")
     parser.add_argument("--min-word-len", type=int, default=3)
     parser.add_argument("--min-sentence-words", type=int, default=2)
+    parser.add_argument("--ignore-mentions", action="store_true", default=True,
+                        help="Ignore words starting with @ (default: True)")
+    parser.add_argument("--no-ignore-mentions", dest="ignore_mentions", action="store_false",
+                        help="Do not ignore @mentions")
+    parser.add_argument("--ignore-commands", action="store_true", default=True,
+                        help="Ignore messages starting with ! (default: True)")
+    parser.add_argument("--no-ignore-commands", dest="ignore_commands", action="store_false",
+                        help="Do not ignore !commands")
     args = parser.parse_args()
 
     ignore_users = [u.strip() for u in args.ignore_users.split(",") if u.strip()]
     ignore_words = [w.strip() for w in args.ignore_words.split(",") if w.strip()]
-    connect_and_listen(args.channel.lower(), args.token, ignore_users, args.min_word_len, args.min_sentence_words, ignore_words)
+
+    connect_and_listen(
+        args.channel.lower(), args.token, ignore_users,
+        args.min_word_len, args.min_sentence_words, ignore_words,
+        args.ignore_mentions, args.ignore_commands
+    )
 
 if __name__ == "__main__":
     main()
