@@ -7,11 +7,15 @@ Twitch Real-Time Chat Sentiment Analyzer v2.1
 - Toggleable @mention and !command filtering
 """
 
+import sys
 import socket
 import re
 import time
 import argparse
 import threading
+import json
+import os
+import tempfile
 from datetime import datetime
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
@@ -35,11 +39,11 @@ sentiment_pipeline = None
 
 def load_models(model_name):
     global embed_model, sentiment_pipeline
-    print(f"[INFO] Loading embedding model: {model_name}...")
+    print(f"[INFO] Loading embedding model: {model_name}...", flush=True)
     embed_model = SentenceTransformer(model_name)
-    print("[INFO] Loading sentiment model...")
+    print("[INFO] Loading sentiment model...", flush=True)
     sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-    print("[INFO] Models ready.\n")
+    print("[INFO] Models ready.\n", flush=True)
 
 STOPWORDS = {"the","a","an","and","or","but","in","on","at","to","for","of","with","is","are","was","were","be","been","being","have","has","had","do","does","did","will","would","could","should","can","this","that","these","those","i","you","he","she","it","we","they","me","him","her","us","them","my","your","his","her","its","our","their","so","just","like","really","very","much","now","here","there","when","where","why","how","all","any","some","no","not","yes","yeah"}
 
@@ -252,113 +256,146 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(300)
-    print(f"[INFO] Connecting to Twitch IRC for #{channel} ...")
+    print(f"[INFO] Connected to Twitch IRC for #{channel} ...", flush=True)
     sock.connect((IRC_HOST, IRC_PORT))
     sock.send(f"PASS {token}\r\n".encode("utf-8"))
     sock.send(f"NICK {nick}\r\n".encode("utf-8"))
     sock.send(f"JOIN #{channel}\r\n".encode("utf-8"))
-    print(f"[INFO] Joined #{channel}. Per-word + sentence-level semantic clustering active.")
-    if ignore_set: print(f"[INFO] Ignoring users: {', '.join(ignore_set)}")
-    if ignore_word_set: print(f"[INFO] Ignoring words: {', '.join(ignore_word_set)}")
-    print(f"[INFO] Ignore @mentions: {ignore_mentions} | Ignore !commands: {ignore_commands}")
-    print(f"[INFO] Min word len: {min_word_len} | Min words/sentence: {min_sentence_words}")
-    print(f"[INFO] Word Similarity Threshold: {word_threshold} | Sentence Similarity Threshold: {sent_threshold}\n")
+    print(f"[INFO] Joined #{channel}. Per-word + sentence-level semantic clustering active.", flush=True)
+    if ignore_set: print(f"[INFO] Ignoring users: {', '.join(ignore_set)}", flush=True)
+    if ignore_word_set: print(f"[INFO] Ignoring words: {', '.join(ignore_word_set)}", flush=True)
+    print(f"[INFO] Ignore @mentions: {ignore_mentions} | Ignore !commands: {ignore_commands}", flush=True)
+    print(f"[INFO] Min word len: {min_word_len} | Min words/sentence: {min_sentence_words}", flush=True)
+    print(f"[INFO] Word Similarity Threshold: {word_threshold} | Sentence Similarity Threshold: {sent_threshold}\n", flush=True)
 
     tracker = SemanticSentimentTracker(min_word_len, min_sentence_words, ignore_word_set, word_threshold, sent_threshold)
-    last_ping = time.time()
+
+    # Create a temp file as the decoupled message feed between IRC reader and analyzer
+    feed_fd, feed_path = tempfile.mkstemp(suffix='.jsonl', prefix='twitch_feed_', text=True)
+    feed_write = os.fdopen(feed_fd, 'w', buffering=1)
+    print(f"[INFO] Chat feed: {feed_path}")
+
+    def irc_reader():
+        """Producer thread: reads from Twitch IRC, writes raw messages to temp file (never blocks on analysis)"""
+        buffer = ""
+        last_ping = time.time()
+        try:
+            while True:
+                try:
+                    data = sock.recv(2048).decode("utf-8", errors="ignore")
+                except socket.timeout:
+                    if time.time() - last_ping > PING_INTERVAL:
+                        sock.send("PING :tmi.twitch.tv\r\n".encode("utf-8"))
+                        last_ping = time.time()
+                    continue
+                if not data:
+                    break
+                buffer += data
+                lines = buffer.split("\r\n")
+                buffer = lines[-1]
+                for line in lines[:-1]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("PING"):
+                        sock.send("PONG :tmi.twitch.tv\r\n".encode("utf-8"))
+                        last_ping = time.time()
+                        continue
+                    match = re.match(r":(\S+)!\S+@\S+\.tmi\.twitch\.tv PRIVMSG #\S+ :(.*)", line)
+                    if match:
+                        user = match.group(1).lower()
+                        if user in ignore_set:
+                            continue
+                        msg = match.group(2).strip()
+                        if msg:
+                            feed_write.write(json.dumps({"text": msg, "ts": time.time(), "user": user}) + "\n")
+                if time.time() - last_ping > PING_INTERVAL:
+                    sock.send("PING :tmi.twitch.tv\r\n".encode("utf-8"))
+                    last_ping = time.time()
+        finally:
+            feed_write.close()
+            sock.close()
 
     def printer():
-            # Variable refresh rate: print more frequently when chat is active
-            while True:
-                # Base sleep time
-                time.sleep(2)  # Minimum 2s between checks
-            
-                with tracker.lock:
-                    current_count = tracker.message_count
-                    new_messages = current_count - tracker.messages_at_last_print
-            
-                # Dynamic sleep adjustment based on chat activity
-                if new_messages >= 10:
-                    # Very active: print immediately (already slept 2s)
-                    pass
-                elif new_messages >= 5:
-                    # Active: no additional sleep
-                    pass
-                elif new_messages >= 2:
-                    # Somewhat active: wait a bit more
-                    time.sleep(1)
-                elif new_messages == 1:
-                    # Quiet: wait longer
-                    time.sleep(2)
-                else:
-                    # Very quiet: wait even longer (but cap it)
-                    time.sleep(3)
-            
-                # Now get the data and print
-                word_top = tracker.get_top_word_sentiments()
-                sent_top = tracker.get_top_sentence_sentiments()
-                msg_count, w_clusters, s_clusters = tracker.status()
-            
-                # Update the last printed count
-                with tracker.lock:
-                    tracker.messages_at_last_print = tracker.message_count
-            
-                print(f"\n=== TOP {TOP_N} WORD CLUSTERS ===")
-                if not word_top:
-                    print("  (No word clusters yet)")
-                else:
-                    for i, s in enumerate(word_top, 1):
-                        print(f"{i:2}. {s['freshness']}{s['polarity']} {s['sentiment']:<16} score={s['score']:.3f} count={s['count']:>3}  ({s['polarity_label']})")
-                        # Compact: truncate long sentences to 80 chars
-                        ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
-                        print(f"     \"{ex}\"  members=[{s['members']}]")
-
-                print(f"\n=== TOP {TOP_N} SIMILAR SENTENCE CLUSTERS ===")
-                if not sent_top:
-                    print("  (No similar sentence groups yet)")
-                else:
-                    for i, s in enumerate(sent_top, 1):
-                        ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
-                        print(f"{i:2}. {s['freshness']}{s['polarity']} score={s['score']:.3f} count={s['count']:>3}  last={s['last_seen']}  ({s['polarity_label']})")
-                        print(f"     \"{ex}\"")
-
-                print(f"\nMessages: {msg_count} | Word clusters: {w_clusters} | Sentence clusters: {s_clusters}")
-                print("─" * 95)
-
-    threading.Thread(target=printer, daemon=True).start()
-
-    buffer = ""
-    try:
         while True:
-            data = sock.recv(2048).decode("utf-8", errors="ignore")
-            if not data: break
-            buffer += data
-            lines = buffer.split("\r\n")
-            buffer = lines[-1]
-            for line in lines[:-1]:
-                line = line.strip()
-                if not line: continue
-                if line.startswith("PING"):
-                    sock.send("PONG :tmi.twitch.tv\r\n".encode("utf-8"))
-                    last_ping = time.time()
+            time.sleep(2)
+
+            with tracker.lock:
+                current_count = tracker.message_count
+                new_messages = current_count - tracker.messages_at_last_print
+
+            if new_messages >= 10:
+                pass
+            elif new_messages >= 5:
+                pass
+            elif new_messages >= 2:
+                time.sleep(1)
+            elif new_messages == 1:
+                time.sleep(2)
+            else:
+                time.sleep(3)
+
+            word_top = tracker.get_top_word_sentiments()
+            sent_top = tracker.get_top_sentence_sentiments()
+            msg_count, w_clusters, s_clusters = tracker.status()
+
+            with tracker.lock:
+                tracker.messages_at_last_print = tracker.message_count
+
+            out_lines = []
+            out_lines.append(f"\n=== TOP {TOP_N} WORD CLUSTERS ===")
+            if not word_top:
+                out_lines.append("  (No word clusters yet)")
+            else:
+                for i, s in enumerate(word_top, 1):
+                    out_lines.append(f"{i:2}. {s['freshness']}{s['polarity']} {s['sentiment']:<16} score={s['score']:.3f} count={s['count']:>3}  ({s['polarity_label']})")
+                    ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
+                    out_lines.append(f"     \"{ex}\"  members=[{s['members']}]")
+
+            out_lines.append(f"\n=== TOP {TOP_N} SIMILAR SENTENCE CLUSTERS ===")
+            if not sent_top:
+                out_lines.append("  (No similar sentence groups yet)")
+            else:
+                for i, s in enumerate(sent_top, 1):
+                    ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
+                    out_lines.append(f"{i:2}. {s['freshness']}{s['polarity']} score={s['score']:.3f} count={s['count']:>3}  last={s['last_seen']}  ({s['polarity_label']})")
+                    out_lines.append(f"     \"{ex}\"")
+
+            out_lines.append(f"\nMessages: {msg_count} | Word clusters: {w_clusters} | Sentence clusters: {s_clusters}")
+            out_lines.append("─" * 95)
+            print("\n".join(out_lines), flush=True)
+
+    # Start all three decoupled threads
+    threading.Thread(target=irc_reader, daemon=True, name="irc-reader").start()
+    threading.Thread(target=printer, daemon=True, name="printer").start()
+    # Consumer runs in the main thread so stdout is always flushed
+    # (daemon threads lose their output when main thread is killed)
+
+    # Main thread reads from the temp file and processes messages
+    try:
+        with open(feed_path, 'r') as f:
+            while True:
+                line = f.readline()
+                if not line:
+                    # If IRC reader thread died, exit
+                    time.sleep(0.2)
                     continue
-                match = re.match(r":(\S+)!\S+@\S+\.tmi\.twitch\.tv PRIVMSG #\S+ :(.*)", line)
-                if match:
-                    user = match.group(1).lower()
-                    if user in ignore_set: continue
-                    msg = match.group(2).strip()
-                    if msg:
-                        tracker.add_message(msg, ignore_mentions=ignore_mentions, ignore_commands=ignore_commands)
-            if time.time() - last_ping > PING_INTERVAL:
-                sock.send("PING :tmi.twitch.tv\r\n".encode("utf-8"))
-                last_ping = time.time()
+                try:
+                    data = json.loads(line.strip())
+                    tracker.add_message(data["text"], ts=data["ts"])
+                except json.JSONDecodeError:
+                    continue
     except KeyboardInterrupt:
-        print("\n[INFO] Stopping...")
+        print("\n[INFO] Stopping...", flush=True)
     finally:
-        sock.close()
-        print("[INFO] Disconnected.")
+        try:
+            os.unlink(feed_path)
+        except OSError:
+            pass
+        print("[INFO] Disconnected.", flush=True)
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(description="Twitch chat sentiment analyzer")
     parser.add_argument("--channel", required=True)
     parser.add_argument("--token", required=True)
