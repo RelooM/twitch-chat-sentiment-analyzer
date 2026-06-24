@@ -53,7 +53,8 @@ TWITCH_EMOTES = {"mods", "kurwa", "pog", "poggers", "kappa", "monka", "pepe", "f
                  "xdd", "prayge", "monkas", "sadge", "pepelaugh", "pepela",
                  "weirdchamp", "pogchamp", "pogyou", "page", "weeg", "snark",
                  "susge", "icant", "goodone", "catjam", "rainbowpls", "kekw",
-                 "clap", "widepeepohappy", "peepohappy", "peeposad", "weirdginger"}
+                 "clap", "widepeepohappy", "peepohappy", "peeposad", "weirdginger",
+                 "kapp"}
 
 def tokenize_words(text, min_len=3, ignore_words=None, ignore_mentions=True):
     # Strip URLs before tokenization (P1)
