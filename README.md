@@ -12,7 +12,7 @@ Real-time sentiment analysis tool for Twitch chat with **per-word** and **senten
 - **Sentence-level clustering** — Similar chat messages grouped together using embeddings
 - **Variable refresh display** — Prints every 2-5 seconds, adaptive to chat activity level
 - **Freshness-weighted scoring** — Newer messages have higher influence; score decays over time
-- **Decoupled IRC streaming** — Chat reading runs in a separate thread, never blocked by analysis
+- **Decoupled IRC streaming** — Chat reading runs in a separate thread with bounded queue, never blocked by analysis
 - **Smart filtering**
   - Ignore specific users (`--ignore-users`)
   - Ignore specific words (`--ignore-words`)
@@ -20,6 +20,7 @@ Real-time sentiment analysis tool for Twitch chat with **per-word** and **senten
   - Minimum sentence length (`--min-sentence-words`)
   - **Toggle @mentions** (`--ignore-mentions` / `--no-ignore-mentions`)
   - **Toggle chat commands** (`--ignore-commands` / `--no-ignore-commands`)
+- **Automatic third‑party emote filtering** — Fetches and ignores BTTV, FFZ, and 7TV emotes for the channel (no extra flag needed)
 - **Configurable embedding models** — Choose from various sentence-transformers models
 - **Adjustable similarity thresholds** — Fine-tune clustering sensitivity
 - Deduplicates repeated words within the same message
@@ -83,21 +84,21 @@ python3 twitch_sentiment_tool.py \
 
 ## Command Line Options
 
-| Option                    | Default | Description                                      |
-|---------------------------|---------|--------------------------------------------------|
-| `--channel`               | —       | Twitch channel to monitor (required)             |
-| `--token`                 | —       | Twitch OAuth token (required)                    |
-| `--ignore-users`          | —       | Comma-separated list of users to ignore          |
-| `--ignore-words`          | —       | Comma-separated list of words to ignore          |
-| `--min-word-len`          | 3       | Minimum characters per word                      |
-| `--min-sentence-words`    | 2       | Minimum number of words in a message             |
-| `--model`                 | all-MiniLM-L6-v2 | Embedding model for sentence-transformers   |
-| `--word-threshold`        | 0.72    | Similarity threshold for word clustering         |
-| `--sent-threshold`        | 0.78    | Similarity threshold for sentence clustering     |
-| `--ignore-mentions`       | True    | Ignore words starting with @                     |
-| `--no-ignore-mentions`    | —       | Disable @mention filtering                       |
-| `--ignore-commands`       | True    | Ignore messages starting with `!`                |
-| `--no-ignore-commands`    | —       | Disable command filtering                        |
+|| Option                    | Default | Description                                      ||
+||---------------------------|---------|--------------------------------------------------||
+|| `--channel`               | —       | Twitch channel to monitor (required)             ||
+|| `--token`                 | —       | Twitch OAuth token (required)                    ||
+|| `--ignore-users`          | —       | Comma-separated list of users to ignore          ||
+|| `--ignore-words`          | —       | Comma-separated list of words to ignore          ||
+|| `--min-word-len`          | 3       | Minimum characters per word                      ||
+|| `--min-sentence-words`    | 2       | Minimum number of words in a message             ||
+|| `--model`                 | all-MiniLM-L6-v2 | Embedding model for sentence-transformers   ||
+|| `--word-threshold`        | 0.72    | Similarity threshold for word clustering         ||
+|| `--sent-threshold`        | 0.78    | Similarity threshold for sentence clustering     ||
+|| `--ignore-mentions`       | True    | Ignore words starting with @                     ||
+|| `--no-ignore-mentions`    | —       | Disable @mention filtering                       ||
+|| `--ignore-commands`       | True    | Ignore messages starting with `!`                ||
+|| `--no-ignore-commands`    | —       | Disable command filtering                        ||
 
 ## Output
 
@@ -127,13 +128,14 @@ Messages: 18 | Word clusters: 47 | Sentence clusters: 17
 
 ## How It Works
 
-1. **Producer thread** connects to Twitch IRC and streams raw messages into a temporary JSONL file (`/tmp/twitch_feed_*.jsonl`) — never blocks on analysis
-2. **Consumer (main thread)** reads from the temp file line by line, runs sentiment + clustering at its own pace
-3. **Printer thread** reads the tracker every 2-5 seconds (faster during active chat, slower when quiet)
-4. Messages are tokenized with configurable minimum length, optionally filtered for @mentions and !commands
-5. Sentiment analysis runs on individual words using a `distilbert-base-uncased-finetuned-sst-2-english` model
-6. Embeddings via `sentence-transformers` cluster both words (top-N most distinctive) and full sentences
-7. Score decays exponentially so recent chat ranks higher; polarity flips when score crosses 0.6
+1. **Producer thread** connects to Twitch IRC, fetches third‑party emotes (BTTV, FFZ, 7TV) for the channel, and streams raw messages into a thread‑safe queue — never blocks on analysis.
+2. **Consumer (main thread)** reads from the queue, runs sentiment + clustering at its own pace.
+3. **Printer thread** reads the tracker every 2-5 seconds (faster during active chat, slower when quiet).
+4. Messages are tokenized with configurable minimum length, optionally filtered for @mentions and !commands.
+5. Stopwords, user‑ignored words, word‑ignored list, and the fetched emote set are removed before sentiment analysis.
+6. Sentiment analysis runs on the cleaned text using a `distilbert-base-uncased-finetuned-sst-2-english` model.
+7. Embeddings via `sentence-transformers` cluster both words (top‑N most distinctive) and full sentences.
+8. Score decays exponentially (configurable half‑life) so recent chat ranks higher; polarity flips when score crosses 0.6.
 
 ## License
 
