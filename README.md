@@ -17,6 +17,8 @@ Real-time sentiment analysis tool for Twitch chat with **per-word** and **senten
   - Minimum sentence length (`--min-sentence-words`)
   - **Toggle @mentions** (`--ignore-mentions` / `--no-ignore-mentions`)
   - **Toggle chat commands** (`--ignore-commands` / `--no-ignore-commands`)
+- **Configurable embedding models** — Choose from various sentence-transformers models
+- **Adjustable similarity thresholds** — Fine-tune clustering sensitivity
 - Deduplicates repeated words within the same message
 
 ## Installation
@@ -65,6 +67,17 @@ python3 twitch_sentiment_tool.py \
   --ignore-commands
 ```
 
+### Custom Model and Thresholds
+
+```bash
+python3 twitch_sentiment_tool.py \
+  --channel yourchannel \
+  --token oauth:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx \
+  --model all-MiniLM-L12-v2 \
+  --word-threshold 0.75 \
+  --sent-threshold 0.80
+```
+
 ## Command Line Options
 
 | Option                    | Default | Description                                      |
@@ -75,6 +88,9 @@ python3 twitch_sentiment_tool.py \
 | `--ignore-words`          | —       | Comma-separated list of words to ignore          |
 | `--min-word-len`          | 3       | Minimum characters per word                      |
 | `--min-sentence-words`    | 2       | Minimum number of words in a message             |
+| `--model`                 | all-MiniLM-L6-v2 | Embedding model for sentence-transformers   |
+| `--word-threshold`        | 0.72    | Similarity threshold for word clustering         |
+| `--sent-threshold`        | 0.78    | Similarity threshold for sentence clustering     |
 | `--ignore-mentions`       | True    | Ignore words starting with @                     |
 | `--no-ignore-mentions`    | —       | Disable @mention filtering                       |
 | `--ignore-commands`       | True    | Ignore messages starting with `!`                |
