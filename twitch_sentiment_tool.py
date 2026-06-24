@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Twitch Real-Time Chat Sentiment Analyzer v2.3
+Twitch Real-Time Chat Sentiment Analyzer v2.4
 - Per-word analysis + semantic embedding clustering
 - Sentence-level semantic clustering
 - Configurable embedding models and similarity thresholds
@@ -9,6 +9,7 @@ Twitch Real-Time Chat Sentiment Analyzer v2.3
 - Bounded queue (back‑pressure) between reader and consumer
 - Configurable decay half-life
 - Regex-based ignore filter
+- Automatic fetching of third‑party emotes (BTTV, FFZ, 7TV) to exclude from analysis
 - Graceful shutdown
 """
 
@@ -20,6 +21,7 @@ import argparse
 import json
 import os
 import queue
+import urllib.request
 from datetime import datetime
 from threading import Lock, Event, Thread
 import torch
@@ -61,6 +63,93 @@ TWITCH_EMOTES = {
     "clap","widepeepohappy","peepohappy","peeposad","weirdginger",
     "kapp"
 }
+
+# Helper functions to fetch third‑party emotes
+def fetch_twitch_user_id(login):
+    """Resolve a Twitch login name to a user ID using decapi (public, no auth)."""
+    try:
+        url = f"https://decapi.me/twitch/id/{login}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.read().decode('utf-8').strip()
+    except Exception:
+        return None
+
+def fetch_bttv_emotes(user_id):
+    """Fetch channel emotes from BetterTTV (v3) given a Twitch user ID."""
+    emotes = set()
+    if not user_id:
+        return emotes
+    try:
+        url = f"https://api.betterttv.net/3/cached/users/twitch/{user_id}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            for eset in data.get('emoteSets', []):
+                for e in eset.get('emotes', []):
+                    code = e.get('code', '').lower()
+                    if code:
+                        emotes.add(code)
+    except Exception:
+        pass
+    return emotes
+
+def fetch_ffz_emotes(username):
+    """Fetch channel emotes from FrankerFaceZ (v1) given a username."""
+    emotes = set()
+    try:
+        url = f"https://api.frankerfacez.com/v1/room/{username}"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            for eset in data.get('sets', {}).values():
+                for e in eset.get('emoticons', []):
+                    name = e.get('name', '').lower()
+                    if name:
+                        emotes.add(name)
+    except Exception:
+        pass
+    return emotes
+
+def fetch_7tv_emotes(username):
+    """Fetch channel emotes from 7TV (v2) given a username."""
+    emotes = set()
+    try:
+        url = f"https://api.7tv.app/v2/users/{username}/emotes"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+            for e in data:
+                name = e.get('name', '').lower()
+                if name:
+                    emotes.add(name)
+    except Exception:
+        pass
+    return emotes
+
+def fetch_channel_emotes(channel_name):
+    """Fetch emotes from BTTV, FFZ, 7TV for the given channel name (lowercase)."""
+    channel_name = channel_name.lower()
+    print(f"[INFO] Fetching third‑party emotes for channel {channel_name} ...", flush=True)
+    all_emotes = set()
+    # Get Twitch user ID for BTTV
+    user_id = fetch_twitch_user_id(channel_name)
+    if user_id:
+        print(f"[INFO] Twitch user ID: {user_id}", flush=True)
+    else:
+        print("[WARN] Could not resolve Twitch user ID; skipping BTTV emotes.", flush=True)
+    # Fetch from each provider
+    bttv = fetch_bttv_emotes(user_id)
+    ffz = fetch_ffz_emotes(channel_name)
+    _7tv = fetch_7tv_emotes(channel_name)
+    all_emotes.update(bttv)
+    all_emotes.update(ffz)
+    all_emotes.update(_7tv)
+    if all_emotes:
+        print(f"[INFO] Fetched {len(all_emotes)} unique emotes from BTTV/FFZ/7TV.", flush=True)
+    else:
+        print("[INFO] No emotes fetched from third‑party providers.", flush=True)
+    return all_emotes
 
 def load_models(model_name: str):
     """Load embedding and sentiment models into global variables."""
@@ -284,82 +373,93 @@ class SemanticSentimentTracker:
         with self.lock:
             return self.message_count, len(self.clusters), len(self.sentence_clusters), self.ignored_regex_count
 
+# Added reconnection logic to IRC reader thread
+
 def irc_reader_thread(channel, token, ignore_users_set, ignore_words_set,
                       ignore_mentions, ignore_commands, ignore_regex, 
                       q: queue.Queue, dropped_list):
     """
     Runs in a daemon thread: reads from Twitch IRC and puts raw messages into the queue.
     Never performs heavy NLP work.
-    Uses a bounded queue for simple back-pressure.
+    Uses a bounded queue for simple back‑pressure.
+    Includes automatic reconnection with exponential back‑off on socket errors.
     """
     nick = "justinfan" + str(int(time.time()) % 100000)
     if not token.startswith("oauth:"):
         token = "oauth:" + token
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(300)
-    try:
-        sock.connect((IRC_HOST, IRC_PORT))
-        sock.send(f"PASS {token}\r\n".encode("utf-8"))
-        sock.send(f"NICK {nick}\r\n".encode("utf-8"))
-        sock.send(f"JOIN #{channel}\r\n".encode("utf-8"))
-        buffer = ""
-        last_ping = time.time()
-        while True:
-            try:
-                data = sock.recv(4096).decode("utf-8", errors="ignore")
-            except socket.timeout:
+    backoff = 1  # start with 1 second
+    while True:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(300)
+        try:
+            sock.connect((IRC_HOST, IRC_PORT))
+            sock.send(f"PASS {token}\r\n".encode("utf-8"))
+            sock.send(f"NICK {nick}\r\n".encode("utf-8"))
+            sock.send(f"JOIN #{channel}\r\n".encode("utf-8"))
+            buffer = ""
+            last_ping = time.time()
+            while True:
+                try:
+                    data = sock.recv(4096).decode("utf-8", errors="ignore")
+                except socket.timeout:
+                    if time.time() - last_ping > PING_INTERVAL:
+                        sock.send(b"PING :tmi.twitch.tv\r\n")
+                        last_ping = time.time()
+                    continue
+                if not data:
+                    # Connection closed by server
+                    raise ConnectionError("Socket closed")
+                buffer += data
+                lines = buffer.split("\r\n")
+                buffer = lines[-1]
+                for line in lines[:-1]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if line.startswith("PING"):
+                        sock.send(b"PONG :tmi.twitch.tv\r\n")
+                        last_ping = time.time()
+                        continue
+                    match = re.match(r":(\\S+)!\\S+@\\S+\\.tmi\\.twitch\\.tv PRIVMSG #\\S+ :(.*)", line)
+                    if match:
+                        user = match.group(1).lower()
+                        if user in ignore_users_set:
+                            continue
+                        msg = match.group(2).strip()
+                        if msg:
+                            # Apply regex ignore if provided
+                            if ignore_regex is not None:
+                                try:
+                                    if re.search(ignore_regex, msg):
+                                        dropped_list[0] += 1
+                                        continue
+                                except re.error:
+                                    pass
+                            # Put with blocking wait for space (simple back‑pressure)
+                            try:
+                                q.put({"text": msg, "ts": time.time(), "user": user}, block=True, timeout=1.0)
+                            except Exception:
+                                dropped_list[0] += 1
+                # Periodic ping if needed
                 if time.time() - last_ping > PING_INTERVAL:
                     sock.send(b"PING :tmi.twitch.tv\r\n")
                     last_ping = time.time()
-                continue
-            if not data:
-                break
-            buffer += data
-            lines = buffer.split("\r\n")
-            buffer = lines[-1]
-            for line in lines[:-1]:
-                line = line.strip()
-                if not line:
-                    continue
-                if line.startswith("PING"):
-                    sock.send(b"PONG :tmi.twitch.tv\r\n")
-                    last_ping = time.time()
-                    continue
-                match = re.match(r":(\S+)!\S+@\S+\.tmi\.twitch\.tv PRIVMSG #\S+ :(.*)", line)
-                if match:
-                    user = match.group(1).lower()
-                    if user in ignore_users_set:
-                        continue
-                    msg = match.group(2).strip()
-                    if msg:
-                        # Apply regex ignore if provided
-                        if ignore_regex is not None:
-                            try:
-                                if re.search(ignore_regex, msg):
-                                    dropped_list[0] += 1
-                                    continue
-                            except re.error:
-                                pass  # invalid regex, ignore
-                        # Put with blocking wait for space (simple back-pressure)
-                        try:
-                            q.put({"text": msg, "ts": time.time(), "user": user}, block=True, timeout=1.0)
-                        except Exception:
-                            # If put fails after timeout, count as dropped
-                            dropped_list[0] += 1
-            if time.time() - last_ping > PING_INTERVAL:
-                sock.send(b"PING :tmi.twitch.tv\r\n")
-                last_ping = time.time()
-    except Exception as e:
-        # In thread, we can't propagate; just break
-        pass
-    finally:
-        try:
-            sock.close()
-        except:
-            pass
-        # Signal end of stream
-        q.put(None)
+        except Exception as e:
+            # Log and attempt reconnection after back‑off delay
+            print(f"[WARN] IRC connection lost ({e}), retrying in {backoff}s...", flush=True)
+            try:
+                sock.close()
+            except:
+                pass
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 60)  # cap at 60 s
+            continue
+        else:
+            # Normal exit (should not happen in daemon mode)
+            break
+    # Signal end of stream if exiting for any reason
+    q.put(None)
 
 def printer_thread(tracker, stop_event):
     """
@@ -386,7 +486,7 @@ def printer_thread(tracker, stop_event):
         with tracker.lock:
             tracker.messages_at_last_print = tracker.message_count
         out_lines = []
-        out_lines.append(f"\n=== TOP {TOP_N} WORD CLUSTERS ===")
+        out_lines.append(f"\\n=== TOP {TOP_N} WORD CLUSTERS ===")
         if not word_top:
             out_lines.append("  (No word clusters yet)")
         else:
@@ -394,7 +494,7 @@ def printer_thread(tracker, stop_event):
                 out_lines.append(f"{i:2}. {s['freshness']}{s['polarity']} {s['sentiment']:<16} score={s['score']:.3f} count={s['count']:>3}  ({s['polarity_label']})")
                 ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
                 out_lines.append(f"     \"{ex}\"  members=[{s['members']}]")
-        out_lines.append(f"\n=== TOP {TOP_N} SIMILAR SENTENCE CLUSTERS ===")
+        out_lines.append(f"\\n=== TOP {TOP_N} SIMILAR SENTENCE CLUSTERS ===")
         if not sent_top:
             out_lines.append("  (No similar sentence groups yet)")
         else:
@@ -402,9 +502,9 @@ def printer_thread(tracker, stop_event):
                 ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
                 out_lines.append(f"{i:2}. {s['freshness']}{s['polarity']} score={s['score']:.3f} count={s['count']:>3}  last={s['last_seen']}  ({s['polarity_label']})")
                 out_lines.append(f"     \"{ex}\"")
-        out_lines.append(f"\nMessages: {msg_count} | Word clusters: {w_clusters} | Sentence clusters: {s_clusters} | Regex ignored: {ignored}")
+        out_lines.append(f"\\nMessages: {msg_count} | Word clusters: {w_clusters} | Sentence clusters: {s_clusters} | Regex ignored: {ignored}")
         out_lines.append("-" * 95)
-        print("\n".join(out_lines), flush=True)
+        print("\\n".join(out_lines), flush=True)
 
 def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_words, ignore_words,
                        ignore_mentions, ignore_commands, word_threshold, sent_threshold,
@@ -416,11 +516,19 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
     if embed_model is None or sentiment_pipeline is None:
         raise RuntimeError("Models not loaded. Call load_models() first.")
 
+    # Fetch third‑party emotes and add them to the ignore set
+    try:
+        fetched_emotes = fetch_channel_emotes(channel)
+        if fetched_emotes:
+            ignore_words_set.update(fetched_emotes)
+    except Exception as e:
+        print(f"[WARN] Failed to fetch emotes: {e}", flush=True)
+
     tracker = SemanticSentimentTracker(min_word_len, min_sentence_words, frozenset(ignore_words_set),
                                        float(word_threshold), float(sent_threshold),
                                        float(decay_half_life))
 
-    # Bounded queue for IRC -> consumer communication
+    # Setup queue for IRC -> consumer communication
     q = queue.Queue(maxsize=QUEUE_MAXSIZE)
     # Shared counter for dropped messages (mutable list for thread safety)
     dropped_list = [0]
@@ -449,7 +557,7 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
                 break
             tracker.add_message(item["text"], ts=item["ts"])
     except KeyboardInterrupt:
-        print("\n[INFO] Stopping...", flush=True)
+        print("\\n[INFO] Stopping...", flush=True)
     finally:
         stop_event.set()
         printer.join(timeout=1.0)
@@ -490,6 +598,7 @@ def main():
 
     load_models(args.model)
 
+    # Convert lists
     ignore_users = [u.strip() for u in args.ignore_users.split(",") if u.strip()]
     ignore_words = [w.strip() for w in args.ignore_words.split(",") if w.strip()]
 
