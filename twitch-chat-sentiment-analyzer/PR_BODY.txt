@@ -1,0 +1,19 @@
+## Implementation Summary
+
+### Changes Made
+- Added `--model` CLI argument for embedding model selection (default: all-MiniLM-L6-v2)
+- Added `--word-threshold` and `--sent-threshold` for configurable clustering similarity
+- Added `requirements.txt` for dependency management
+- Updated `README.md` with complete documentation for all CLI options
+
+### Technical Details
+- Modified `SemanticSentimentTracker` class to accept configurable thresholds
+- Updated `connect_and_listen()` to pass model configuration
+- Maintained backward compatibility with existing defaults
+
+### Benefits
+- Users can fine-tune model performance for their use case
+- Larger embedding models can be selected for better accuracy
+- Similarity thresholds can be adjusted for chat volume/tone
+
+Enhancement proposal for flexible model configuration
