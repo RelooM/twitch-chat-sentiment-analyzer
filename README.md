@@ -7,9 +7,12 @@ Real-time sentiment analysis tool for Twitch chat with **per-word** and **senten
 
 ## Features
 
-- **Per-word semantic analysis** — Every meaningful word is analyzed individually
-- **Sentence-level clustering** — Groups similar chat messages together using embeddings
-- **Freshness-weighted scoring** — Newer messages have higher influence
+- **Guaranteed message counting** — Every non-command message is counted and tracked
+- **Per-word semantic clustering** — Meaningful words are grouped by semantic similarity + sentiment
+- **Sentence-level clustering** — Similar chat messages grouped together using embeddings
+- **Variable refresh display** — Prints every 2-5 seconds, adaptive to chat activity level
+- **Freshness-weighted scoring** — Newer messages have higher influence; score decays over time
+- **Decoupled IRC streaming** — Chat reading runs in a separate thread, never blocked by analysis
 - **Smart filtering**
   - Ignore specific users (`--ignore-users`)
   - Ignore specific words (`--ignore-words`)
@@ -98,16 +101,17 @@ python3 twitch_sentiment_tool.py \
 
 ## Output
 
-The tool displays two live-updating sections every 8 seconds:
+The tool displays two live-updating sections (refresh every 2–5 seconds, adaptive to activity):
 
 ### Word Clusters
 Top semantically grouped words with sentiment polarity, freshness indicators, and representative sentences.
 - **➕** = positive sentiment · **➖** = negative sentiment · **⚪** = neutral
-- **🆕** = seen in the last 30 seconds
-- Score decays exponentially with time — recent chat ranks higher
+- **🆕** = seen in the last 30 seconds; **🔄** = recurring cluster (seen before but still active)
+- Score decays exponentially — recent chat ranks higher
+- Polarity tracked as net score: messages with `score > 0.6` shift polarity; mixed clusters show both
 
 ### Similar Sentence Clusters
-Groups of nearly identical or highly similar chat messages (e.g. repeated hype, complaints, etc.), with polarity labels.
+Groups of nearly identical or highly similar chat messages (e.g. repeated hype, complaints, etc.), with polarity labels and cumulative score.
 
 ### Example Output
 ```
@@ -123,12 +127,13 @@ Messages: 18 | Word clusters: 47 | Sentence clusters: 17
 
 ## How It Works
 
-1. Connects to Twitch IRC
-2. Optionally filters @mentions and !commands
-3. Tokenizes messages with configurable minimum length
-4. Runs sentiment analysis on individual words
-5. Uses `sentence-transformers` to cluster both words and full sentences
-6. Applies exponential decay so recent chat ranks higher
+1. **Producer thread** connects to Twitch IRC and streams raw messages into a temporary JSONL file (`/tmp/twitch_feed_*.jsonl`) — never blocks on analysis
+2. **Consumer (main thread)** reads from the temp file line by line, runs sentiment + clustering at its own pace
+3. **Printer thread** reads the tracker every 2-5 seconds (faster during active chat, slower when quiet)
+4. Messages are tokenized with configurable minimum length, optionally filtered for @mentions and !commands
+5. Sentiment analysis runs on individual words using a `distilbert-base-uncased-finetuned-sst-2-english` model
+6. Embeddings via `sentence-transformers` cluster both words (top-N most distinctive) and full sentences
+7. Score decays exponentially so recent chat ranks higher; polarity flips when score crosses 0.6
 
 ## License
 
