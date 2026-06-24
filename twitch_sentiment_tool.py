@@ -48,7 +48,9 @@ STOPWORDS = {"the","a","an","and","or","but","in","on","at","to","for","of","wit
 TWITCH_EMOTES = {"mods", "kurwa", "pog", "poggers", "kappa", "monka", "pepe", "feels",
                  "lul", "omegalul", "keks", "widepeepo", "dendi", "ayaya", "dentge",
                  "xdd", "prayge", "monkas", "sadge", "pepelaugh", "pepela",
-                 "weirdchamp", "pogchamp", "pogyou", "page", "weeg", "snark"}
+                 "weirdchamp", "pogchamp", "pogyou", "page", "weeg", "snark",
+                 "susge", "icant", "goodone", "catjam", "rainbowpls", "kekw",
+                 "clap", "widepeepohappy", "peepohappy", "peeposad", "weirdginger"}
 
 def tokenize_words(text, min_len=3, ignore_words=None, ignore_mentions=True):
     # Strip URLs before tokenization (P1)
