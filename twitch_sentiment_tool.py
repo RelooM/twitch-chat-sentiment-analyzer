@@ -22,7 +22,6 @@ IRC_PORT = 6667
 PING_INTERVAL = 60
 TOP_N = 10
 SLIDING_WINDOW_SECONDS = 300
-PRINT_INTERVAL_SECONDS = 8
 DECAY_HALF_LIFE_SECONDS = 45
 
 # Defaults that can be overridden by CLI args
@@ -92,6 +91,8 @@ class SemanticSentimentTracker:
         self.ignore_words = ignore_words or set()
         self.word_threshold = word_threshold
         self.sent_threshold = sent_threshold
+        # For variable refresh rate
+        self.messages_at_last_print = 0
 
     def _get_embedding(self, text):
         return embed_model.encode(text, convert_to_tensor=True, show_progress_bar=False)
@@ -112,41 +113,11 @@ class SemanticSentimentTracker:
             sent_score = 0.0
 
         words = tokenize_words(text, self.min_word_len, self.ignore_words, ignore_mentions)
-        if len(words) < self.min_sentence_words:
-            return
-        words = list(dict.fromkeys(words))
 
         with self.lock:
             self.message_count += 1
 
-            # Word-level clustering
-            for word in words:
-                word_score = get_word_sentiment(word, sent_score)
-                emb = self._get_embedding(word)
-                matched = False
-                for cluster in self.clusters:
-                    if float(util.cos_sim(emb, cluster["embedding"])) >= self.word_threshold:
-                        age = ts - cluster["last_ts"]
-                        decay = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
-                        # P2: Decay stored scores before accumulating
-                        cluster["total_score"] = cluster["total_score"] * decay + abs(word_score)
-                        cluster["net_score"] = cluster["net_score"] * decay + word_score
-                        cluster["count"] += 1
-                        cluster["last_ts"] = ts
-                        if word not in cluster["members"]:
-                            cluster["members"].append(word)
-                        if ts >= cluster.get("last_ts", 0):
-                            cluster["best_sentence"] = text
-                        matched = True
-                        break
-                if not matched:
-                    self.clusters.append({
-                        "rep_word": word, "embedding": emb, "total_score": abs(word_score),
-                        "net_score": word_score,
-                        "count": 1, "last_ts": ts, "members": [word], "best_sentence": text
-                    })
-
-            # Sentence-level clustering
+            # Always do sentence-level clustering for every chat message
             sent_emb = self._get_embedding(text)
             matched_sent = False
             for scluster in self.sentence_clusters:
@@ -171,6 +142,36 @@ class SemanticSentimentTracker:
                     "last_ts": ts,
                     "examples": [text]
                 })
+
+            # Word-level clustering: only when enough meaningful words exist
+            if len(words) >= self.min_sentence_words:
+                words = list(dict.fromkeys(words))
+                for word in words:
+                    word_score = get_word_sentiment(word, sent_score)
+                    emb = self._get_embedding(word)
+                    matched = False
+                    for cluster in self.clusters:
+                        if float(util.cos_sim(emb, cluster["embedding"])) >= self.word_threshold:
+                            age = ts - cluster["last_ts"]
+                            decay = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
+                            # P2: Decay stored scores before accumulating
+                            cluster["total_score"] = cluster["total_score"] * decay + abs(word_score)
+                            cluster["net_score"] = cluster["net_score"] * decay + word_score
+                            cluster["count"] += 1
+                            cluster["last_ts"] = ts
+                            if word not in cluster["members"]:
+                                cluster["members"].append(word)
+                            # Update best_sentence even from short-word messages (stored text is always full)
+                            if ts >= cluster.get("last_ts", 0):
+                                cluster["best_sentence"] = text
+                            matched = True
+                            break
+                    if not matched:
+                        self.clusters.append({
+                            "rep_word": word, "embedding": emb, "total_score": abs(word_score),
+                            "net_score": word_score,
+                            "count": 1, "last_ts": ts, "members": [word], "best_sentence": text
+                        })
 
             cutoff = ts - SLIDING_WINDOW_SECONDS
             self.clusters = [c for c in self.clusters if c["last_ts"] >= cutoff]
@@ -267,33 +268,62 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
     last_ping = time.time()
 
     def printer():
-        while True:
-            time.sleep(PRINT_INTERVAL_SECONDS)
-            word_top = tracker.get_top_word_sentiments()
-            sent_top = tracker.get_top_sentence_sentiments()
-            msg_count, w_clusters, s_clusters = tracker.status()
+            # Variable refresh rate: print more frequently when chat is active
+            while True:
+                # Base sleep time
+                time.sleep(2)  # Minimum 2s between checks
+            
+                with tracker.lock:
+                    current_count = tracker.message_count
+                    new_messages = current_count - tracker.messages_at_last_print
+            
+                # Dynamic sleep adjustment based on chat activity
+                if new_messages >= 10:
+                    # Very active: print immediately (already slept 2s)
+                    pass
+                elif new_messages >= 5:
+                    # Active: no additional sleep
+                    pass
+                elif new_messages >= 2:
+                    # Somewhat active: wait a bit more
+                    time.sleep(1)
+                elif new_messages == 1:
+                    # Quiet: wait longer
+                    time.sleep(2)
+                else:
+                    # Very quiet: wait even longer (but cap it)
+                    time.sleep(3)
+            
+                # Now get the data and print
+                word_top = tracker.get_top_word_sentiments()
+                sent_top = tracker.get_top_sentence_sentiments()
+                msg_count, w_clusters, s_clusters = tracker.status()
+            
+                # Update the last printed count
+                with tracker.lock:
+                    tracker.messages_at_last_print = tracker.message_count
+            
+                print(f"\n=== TOP {TOP_N} WORD CLUSTERS ===")
+                if not word_top:
+                    print("  (No word clusters yet)")
+                else:
+                    for i, s in enumerate(word_top, 1):
+                        print(f"{i:2}. {s['freshness']}{s['polarity']} {s['sentiment']:<16} score={s['score']:.3f} count={s['count']:>3}  ({s['polarity_label']})")
+                        # Compact: truncate long sentences to 80 chars
+                        ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
+                        print(f"     \"{ex}\"  members=[{s['members']}]")
 
-            print(f"\n=== TOP {TOP_N} WORD CLUSTERS ===")
-            if not word_top:
-                print("  (No word clusters yet)")
-            else:
-                for i, s in enumerate(word_top, 1):
-                    print(f"{i:2}. {s['freshness']}{s['polarity']} {s['sentiment']:<16} score={s['score']:.3f} count={s['count']:>3}  ({s['polarity_label']})")
-                    # Compact: truncate long sentences to 80 chars
-                    ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
-                    print(f"     \"{ex}\"  members=[{s['members']}]")
+                print(f"\n=== TOP {TOP_N} SIMILAR SENTENCE CLUSTERS ===")
+                if not sent_top:
+                    print("  (No similar sentence groups yet)")
+                else:
+                    for i, s in enumerate(sent_top, 1):
+                        ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
+                        print(f"{i:2}. {s['freshness']}{s['polarity']} score={s['score']:.3f} count={s['count']:>3}  last={s['last_seen']}  ({s['polarity_label']})")
+                        print(f"     \"{ex}\"")
 
-            print(f"\n=== TOP {TOP_N} SIMILAR SENTENCE CLUSTERS ===")
-            if not sent_top:
-                print("  (No similar sentence groups yet)")
-            else:
-                for i, s in enumerate(sent_top, 1):
-                    ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
-                    print(f"{i:2}. {s['freshness']}{s['polarity']} score={s['score']:.3f} count={s['count']:>3}  last={s['last_seen']}  ({s['polarity_label']})")
-                    print(f"     \"{ex}\"")
-
-            print(f"\nMessages: {msg_count} | Word clusters: {w_clusters} | Sentence clusters: {s_clusters}")
-            print("─" * 95)
+                print(f"\nMessages: {msg_count} | Word clusters: {w_clusters} | Sentence clusters: {s_clusters}")
+                print("─" * 95)
 
     threading.Thread(target=printer, daemon=True).start()
 
@@ -335,7 +365,8 @@ def main():
     parser.add_argument("--ignore-users", default="")
     parser.add_argument("--ignore-words", default="")
     parser.add_argument("--min-word-len", type=int, default=3)
-    parser.add_argument("--min-sentence-words", type=int, default=2)
+    parser.add_argument("--min-sentence-words", type=int, default=2,
+                        help="Minimum meaningful words for a message to contribute to word clusters (default: 2; sentence clustering always runs)")
     parser.add_argument("--model", default=DEFAULT_EMBED_MODEL, help=f"Embedding model to use (default: {DEFAULT_EMBED_MODEL})")
     parser.add_argument("--word-threshold", type=float, default=DEFAULT_WORD_SIMILARITY_THRESHOLD, help=f"Similarity threshold for word clustering (default: {DEFAULT_WORD_SIMILARITY_THRESHOLD})")
     parser.add_argument("--sent-threshold", type=float, default=DEFAULT_SENTENCE_SIMILARITY_THRESHOLD, help=f"Similarity threshold for sentence clustering (default: {DEFAULT_SENTENCE_SIMILARITY_THRESHOLD})")
