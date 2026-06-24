@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Twitch Real-Time Chat Sentiment Analyzer v2
+Twitch Real-Time Chat Sentiment Analyzer v2.1
 - Per-word analysis + semantic embedding clustering
 - Sentence-level semantic clustering
+- Configurable embedding models and similarity thresholds
 - Toggleable @mention and !command filtering
 """
 
@@ -23,15 +24,23 @@ TOP_N = 10
 SLIDING_WINDOW_SECONDS = 300
 PRINT_INTERVAL_SECONDS = 8
 DECAY_HALF_LIFE_SECONDS = 45
-SIMILARITY_THRESHOLD = 0.72
-SENTENCE_SIMILARITY_THRESHOLD = 0.78
-EMBED_MODEL = "all-MiniLM-L6-v2"
 
-print("[INFO] Loading embedding model...")
-embed_model = SentenceTransformer(EMBED_MODEL)
-print("[INFO] Loading sentiment model...")
-sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
-print("[INFO] Models ready.\n")
+# Defaults that can be overridden by CLI args
+DEFAULT_WORD_SIMILARITY_THRESHOLD = 0.72
+DEFAULT_SENTENCE_SIMILARITY_THRESHOLD = 0.78
+DEFAULT_EMBED_MODEL = "all-MiniLM-L6-v2"
+
+# Global holders for models
+embed_model = None
+sentiment_pipeline = None
+
+def load_models(model_name):
+    global embed_model, sentiment_pipeline
+    print(f"[INFO] Loading embedding model: {model_name}...")
+    embed_model = SentenceTransformer(model_name)
+    print("[INFO] Loading sentiment model...")
+    sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+    print("[INFO] Models ready.\n")
 
 STOPWORDS = {"the","a","an","and","or","but","in","on","at","to","for","of","with","is","are","was","were","be","been","being","have","has","had","do","does","did","will","would","could","should","can","this","that","these","those","i","you","he","she","it","we","they","me","him","her","us","them","my","your","his","her","its","our","their","so","just","like","really","very","much","now","here","there","when","where","why","how","all","any","some","no","not","yes","yeah","lol","lmao","omg","wtf","gg","ez","pog","poggers","kappa","monka","pepe","feels","good","bad","nice","love","hate"}
 
@@ -61,7 +70,9 @@ def get_word_sentiment(word, sentence_score):
         return 0.0
 
 class SemanticSentimentTracker:
-    def __init__(self, min_word_len=3, min_sentence_words=2, ignore_words=None):
+    def __init__(self, min_word_len=3, min_sentence_words=2, ignore_words=None, 
+                 word_threshold=DEFAULT_WORD_SIMILARITY_THRESHOLD, 
+                 sent_threshold=DEFAULT_SENTENCE_SIMILARITY_THRESHOLD):
         self.clusters = []
         self.sentence_clusters = []
         self.lock = threading.Lock()
@@ -69,6 +80,8 @@ class SemanticSentimentTracker:
         self.min_word_len = min_word_len
         self.min_sentence_words = min_sentence_words
         self.ignore_words = ignore_words or set()
+        self.word_threshold = word_threshold
+        self.sent_threshold = sent_threshold
 
     def _get_embedding(self, text):
         return embed_model.encode(text, convert_to_tensor=True, show_progress_bar=False)
@@ -77,7 +90,6 @@ class SemanticSentimentTracker:
         if ts is None:
             ts = time.time()
 
-        # Skip command messages if enabled
         if ignore_commands and text.strip().startswith('!'):
             return
 
@@ -103,7 +115,7 @@ class SemanticSentimentTracker:
                 emb = self._get_embedding(word)
                 matched = False
                 for cluster in self.clusters:
-                    if float(util.cos_sim(emb, cluster["embedding"])) >= SIMILARITY_THRESHOLD:
+                    if float(util.cos_sim(emb, cluster["embedding"])) >= self.word_threshold:
                         age = ts - cluster["last_ts"]
                         freshness = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
                         weighted = abs(word_score) * freshness
@@ -126,7 +138,7 @@ class SemanticSentimentTracker:
             sent_emb = self._get_embedding(text)
             matched_sent = False
             for scluster in self.sentence_clusters:
-                if float(util.cos_sim(sent_emb, scluster["embedding"])) >= SENTENCE_SIMILARITY_THRESHOLD:
+                if float(util.cos_sim(sent_emb, scluster["embedding"])) >= self.sent_threshold:
                     age = ts - scluster["last_ts"]
                     freshness = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
                     scluster["total_score"] += abs(sent_score) * freshness
@@ -196,13 +208,13 @@ class SemanticSentimentTracker:
             return self.message_count, len(self.clusters), len(self.sentence_clusters)
 
 def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_words, ignore_words,
-                       ignore_mentions, ignore_commands):
+                       ignore_mentions, ignore_commands, word_threshold, sent_threshold):
     ignore_set = {u.lower().strip() for u in ignore_users} if ignore_users else set()
     ignore_word_set = {w.lower().strip() for w in ignore_words} if ignore_words else set()
 
     nick = "justinfan" + str(int(time.time()) % 100000)
     if not token.startswith("oauth:"):
-        token = "oauth:" + token
+        token = "oauth:\" + token
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(300)
@@ -215,9 +227,10 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
     if ignore_set: print(f"[INFO] Ignoring users: {', '.join(ignore_set)}")
     if ignore_word_set: print(f"[INFO] Ignoring words: {', '.join(ignore_word_set)}")
     print(f"[INFO] Ignore @mentions: {ignore_mentions} | Ignore !commands: {ignore_commands}")
-    print(f"[INFO] Min word len: {min_word_len} | Min words/sentence: {min_sentence_words}\n")
+    print(f"[INFO] Min word len: {min_word_len} | Min words/sentence: {min_sentence_words}")
+    print(f"[INFO] Word Similarity Threshold: {word_threshold} | Sentence Similarity Threshold: {sent_threshold}\n")
 
-    tracker = SemanticSentimentTracker(min_word_len, min_sentence_words, ignore_word_set)
+    tracker = SemanticSentimentTracker(min_word_len, min_sentence_words, ignore_word_set, word_threshold, sent_threshold)
     last_ping = time.time()
 
     def printer():
@@ -287,6 +300,9 @@ def main():
     parser.add_argument("--ignore-words", default="")
     parser.add_argument("--min-word-len", type=int, default=3)
     parser.add_argument("--min-sentence-words", type=int, default=2)
+    parser.add_argument("--model", default=DEFAULT_EMBED_MODEL, help=f"Embedding model to use (default: {DEFAULT_EMBED_MODEL})")
+    parser.add_argument("--word-threshold", type=float, default=DEFAULT_WORD_SIMILARITY_THRESHOLD, help=f"Similarity threshold for word clustering (default: {DEFAULT_WORD_SIMILARITY_THRESHOLD})")
+    parser.add_argument("--sent-threshold", type=float, default=DEFAULT_SENTENCE_SIMILARITY_THRESHOLD, help=f"Similarity threshold for sentence clustering (default: {DEFAULT_SENTENCE_SIMILARITY_THRESHOLD})")
     parser.add_argument("--ignore-mentions", action="store_true", default=True,
                         help="Ignore words starting with @ (default: True)")
     parser.add_argument("--no-ignore-mentions", dest="ignore_mentions", action="store_false",
@@ -297,13 +313,15 @@ def main():
                         help="Do not ignore !commands")
     args = parser.parse_args()
 
+    load_models(args.model)
+
     ignore_users = [u.strip() for u in args.ignore_users.split(",") if u.strip()]
     ignore_words = [w.strip() for w in args.ignore_words.split(",") if w.strip()]
 
     connect_and_listen(
         args.channel.lower(), args.token, ignore_users,
         args.min_word_len, args.min_sentence_words, ignore_words,
-        args.ignore_mentions, args.ignore_commands
+        args.ignore_mentions, args.ignore_commands, args.word_threshold, args.sent_threshold
     )
 
 if __name__ == "__main__":
