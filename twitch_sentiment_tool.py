@@ -162,14 +162,14 @@ def load_models(model_name: str):
 
 def tokenize_words(text, min_len=3, ignore_words=None, ignore_mentions=True):
     # Strip URLs before tokenization (P1)
-    text = re.sub(r'https?://\\S+', '', text)
+    text = re.sub(r'https?://\S+', '', text)
     ignore_set = ignore_words or set()
     if ignore_mentions:
         # Filter @mentions before regex — split words, drop @-prefixed tokens (P0)
         tokens = text.lower().split()
         tokens = [t for t in tokens if not t.startswith('@')]
         text = ' '.join(tokens)
-    pattern = rf'\\b[a-zA-Z]{{{min_len},}}\\b'
+    pattern = rf'\b[a-zA-Z]{{{min_len},}}\b'
     words = re.findall(pattern, text.lower())
     result = []
     for w in words:
@@ -421,7 +421,7 @@ def irc_reader_thread(channel, token, ignore_users_set, ignore_words_set,
                         sock.send(b"PONG :tmi.twitch.tv\r\n")
                         last_ping = time.time()
                         continue
-                    match = re.match(r":(\\S+)!\\S+@\\S+\\.tmi\\.twitch\\.tv PRIVMSG #\\S+ :(.*)", line)
+                    match = re.match(r":(\S+)!\S+@\S+\.tmi\.twitch\.tv PRIVMSG #\S+ :(.*)", line)
                     if match:
                         user = match.group(1).lower()
                         if user in ignore_users_set:
