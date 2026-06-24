@@ -5,11 +5,11 @@ Twitch Real-Time Chat Sentiment Analyzer v2.3
 - Sentence-level semantic clustering
 - Configurable embedding models and similarity thresholds
 - Toggleable @mention and !command filtering
-- IRC runner in separate multiprocessing process for true isolation
-- Uses bounded multiprocessing.Queue for message passing with back-pressure
+- IRC reader in a daemon thread (true decoupling via temp file or in-memory queue)
+- Bounded queue (back‑pressure) between reader and consumer
 - Configurable decay half-life
 - Regex-based ignore filter
-- Graceful shutdown via sentinel
+- Graceful shutdown
 """
 
 import sys
@@ -19,10 +19,10 @@ import time
 import argparse
 import json
 import os
+import queue
 from datetime import datetime
-from multiprocessing import Process, Queue, Value
-import torch
 from threading import Lock, Event, Thread
+import torch
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
 
@@ -194,8 +194,6 @@ class SemanticSentimentTracker:
                             # P2: Decay stored scores before accumulating
                             cluster["total_score"] = cluster["total_score"] * decay + abs(word_score)
                             cluster["net_score"] = cluster["net_score"] * decay + word_score
-                            count_before = cluster["count"]
-                            # Note: we don't need count_before
                             cluster["count"] += 1
                             cluster["last_ts"] = ts
                             if word not in cluster["members"]:
@@ -286,15 +284,14 @@ class SemanticSentimentTracker:
         with self.lock:
             return self.message_count, len(self.clusters), len(self.sentence_clusters), self.ignored_regex_count
 
-def irc_reader_process(channel, token, ignore_users_set, ignore_words_set,
-                       ignore_mentions, ignore_commands, ignore_regex, q: Queue, dropped_counter: Value):
+def irc_reader_thread(channel, token, ignore_users_set, ignore_words_set,
+                      ignore_mentions, ignore_commands, ignore_regex, 
+                      q: queue.Queue, dropped_list):
     """
-    Runs in a separate process: reads from Twitch IRC and puts raw messages into the queue.
+    Runs in a daemon thread: reads from Twitch IRC and puts raw messages into the queue.
     Never performs heavy NLP work.
-    Implements back-pressure: if queue is full, blocks until space available.
-    Tracks dropped messages due to queue full (if timeout) via dropped_counter.
+    Uses a bounded queue for simple back-pressure.
     """
-    # Build nick
     nick = "justinfan" + str(int(time.time()) % 100000)
     if not token.startswith("oauth:"):
         token = "oauth:" + token
@@ -303,9 +300,9 @@ def irc_reader_process(channel, token, ignore_users_set, ignore_words_set,
     sock.settimeout(300)
     try:
         sock.connect((IRC_HOST, IRC_PORT))
-        sock.send(f"PASS {token}\\r\\n".encode("utf-8"))
-        sock.send(f"NICK {nick}\\r\\n".encode("utf-8"))
-        sock.send(f"JOIN #{channel}\\r\\n".encode("utf-8"))
+        sock.send(f"PASS {token}\r\n".encode("utf-8"))
+        sock.send(f"NICK {nick}\r\n".encode("utf-8"))
+        sock.send(f"JOIN #{channel}\r\n".encode("utf-8"))
         buffer = ""
         last_ping = time.time()
         while True:
@@ -313,7 +310,7 @@ def irc_reader_process(channel, token, ignore_users_set, ignore_words_set,
                 data = sock.recv(4096).decode("utf-8", errors="ignore")
             except socket.timeout:
                 if time.time() - last_ping > PING_INTERVAL:
-                    sock.send(b"PING :tmi.twitch.tv\\r\\n")
+                    sock.send(b"PING :tmi.twitch.tv\r\n")
                     last_ping = time.time()
                 continue
             if not data:
@@ -326,10 +323,10 @@ def irc_reader_process(channel, token, ignore_users_set, ignore_words_set,
                 if not line:
                     continue
                 if line.startswith("PING"):
-                    sock.send(b"PONG :tmi.twitch.tv\\r\\n")
+                    sock.send(b"PONG :tmi.twitch.tv\r\n")
                     last_ping = time.time()
                     continue
-                match = re.match(r":(\\S+)!\\S+@\\S+\\.tmi\\.twitch\\.tv PRIVMSG #\\S+ :(.*)", line)
+                match = re.match(r":(\S+)!\S+@\S+\.tmi\.twitch\.tv PRIVMSG #\S+ :(.*)", line)
                 if match:
                     user = match.group(1).lower()
                     if user in ignore_users_set:
@@ -340,8 +337,7 @@ def irc_reader_process(channel, token, ignore_users_set, ignore_words_set,
                         if ignore_regex is not None:
                             try:
                                 if re.search(ignore_regex, msg):
-                                    with dropped_counter.get_lock():
-                                        dropped_counter.value += 1
+                                    dropped_list[0] += 1
                                     continue
                             except re.error:
                                 pass  # invalid regex, ignore
@@ -350,34 +346,30 @@ def irc_reader_process(channel, token, ignore_users_set, ignore_words_set,
                             q.put({"text": msg, "ts": time.time(), "user": user}, block=True, timeout=1.0)
                         except Exception:
                             # If put fails after timeout, count as dropped
-                            with dropped_counter.get_lock():
-                                dropped_counter.value += 1
+                            dropped_list[0] += 1
             if time.time() - last_ping > PING_INTERVAL:
-                sock.send(b"PING :tmi.twitch.tv\\r\\n")
+                sock.send(b"PING :tmi.twitch.tv\r\n")
                 last_ping = time.time()
     except Exception as e:
-        # In child process, we can't easily propagate; just break
+        # In thread, we can't propagate; just break
         pass
     finally:
         try:
             sock.close()
         except:
             pass
-        # Send sentinel to signal end
+        # Signal end of stream
         q.put(None)
 
-def printer_process(tracker, stop_event):
+def printer_thread(tracker, stop_event):
     """
-    Runs in a separate thread (kept in main process) to avoid blocking stdout.
+    Runs in a daemon thread: reads from tracker and prints periodic updates.
     """
-    import time
-    from datetime import datetime
     while not stop_event.is_set():
         time.sleep(2)
         with tracker.lock:
             current_count = tracker.message_count
             new_messages = current_count - tracker.messages_at_last_print
-            ignored_regex = tracker.ignored_regex_count
         if new_messages >= 10:
             pass
         elif new_messages >= 5:
@@ -420,7 +412,6 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
     ignore_users_set = {u.lower().strip() for u in ignore_users} if ignore_users else set()
     ignore_words_set = {w.lower().strip() for w in ignore_words} if ignore_words else set()
 
-    # Ensure models are loaded (should have been done in main())
     global embed_model, sentiment_pipeline
     if embed_model is None or sentiment_pipeline is None:
         raise RuntimeError("Models not loaded. Call load_models() first.")
@@ -429,46 +420,41 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
                                        float(word_threshold), float(sent_threshold),
                                        float(decay_half_life))
 
-    # Setup multiprocessing queue for IRC -> main communication
-    q = Queue(maxsize=QUEUE_MAXSIZE)
-    # Shared counter for dropped messages due to queue full
-    from multiprocessing import Value
-    dropped_counter = Value('i', 0)
+    # Bounded queue for IRC -> consumer communication
+    q = queue.Queue(maxsize=QUEUE_MAXSIZE)
+    # Shared counter for dropped messages (mutable list for thread safety)
+    dropped_list = [0]
 
-    # Start IRC reader process
-    irc_proc = Process(target=irc_reader_process,
-                       args=(channel, token, frozenset(ignore_users_set), frozenset(ignore_words_set),
-                             bool(ignore_mentions), bool(ignore_commands), 
-                             ignore_regex, q, dropped_counter),
-                       daemon=True)
-    irc_proc.start()
+    # Start IRC reader thread
+    irc_thread = Thread(
+        target=irc_reader_thread,
+        args=(channel, token, frozenset(ignore_users_set), frozenset(ignore_words_set),
+              bool(ignore_mentions), bool(ignore_commands), ignore_regex, q, dropped_list),
+        daemon=True
+    )
+    irc_thread.start()
+    print(f"[INFO] Connected to Twitch IRC for #{channel} ...", flush=True)
+    print(f"[INFO] Joined #{channel}. Decoupled per-word + sentence-level semantic clustering active.", flush=True)
 
-    # Printer as a thread in main process (simpler)
+    # Printer as daemon thread
     stop_event = Event()
-    printer_thread = Thread(target=printer_process, args=(tracker, stop_event), daemon=True)
-    printer_thread.start()
+    printer = Thread(target=printer_thread, args=(tracker, stop_event), daemon=True)
+    printer.start()
 
     # Main consumer loop: read from queue and feed tracker
     try:
         while True:
             item = q.get()
-            if item is None:  # sentinel from IRC process indicating end
+            if item is None:  # sentinel indicating end of stream
                 break
             tracker.add_message(item["text"], ts=item["ts"])
     except KeyboardInterrupt:
         print("\n[INFO] Stopping...", flush=True)
     finally:
-        # Signal printer to stop
         stop_event.set()
-        printer_thread.join(timeout=1.0)
-        # Wait for IRC process to finish (it should have exited after sending sentinel)
-        irc_proc.join(timeout=2.0)
-        if irc_proc.is_alive():
-            irc_proc.terminate()
-            irc_proc.join()
-        # Report dropped stats
-        with dropped_counter.get_lock():
-            dropped = dropped_counter.value
+        printer.join(timeout=1.0)
+        # Thread will stop when process exits; just report dropped stats
+        dropped = dropped_list[0]
         if dropped:
             print(f"[INFO] Dropped {dropped} messages due to queue full or regex filter.", flush=True)
         print("[INFO] Disconnected.", flush=True)
@@ -504,15 +490,13 @@ def main():
 
     load_models(args.model)
 
-    # Convert lists
     ignore_users = [u.strip() for u in args.ignore_users.split(",") if u.strip()]
     ignore_words = [w.strip() for w in args.ignore_words.split(",") if w.strip()]
 
     connect_and_listen(
         args.channel.lower(), args.token, ignore_users,
         args.min_word_len, args.min_sentence_words, ignore_words,
-        args.ignore_mentions, args.ignore_commands, 
-        args.word_threshold, args.sent_threshold,
+        args.ignore_mentions, args.ignore_commands, args.word_threshold, args.sent_threshold,
         args.decay_halflife, args.ignore_regex
     )
 
