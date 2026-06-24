@@ -42,17 +42,32 @@ def load_models(model_name):
     sentiment_pipeline = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
     print("[INFO] Models ready.\n")
 
-STOPWORDS = {"the","a","an","and","or","but","in","on","at","to","for","of","with","is","are","was","were","be","been","being","have","has","had","do","does","did","will","would","could","should","can","this","that","these","those","i","you","he","she","it","we","they","me","him","her","us","them","my","your","his","her","its","our","their","so","just","like","really","very","much","now","here","there","when","where","why","how","all","any","some","no","not","yes","yeah","lol","lmao","omg","wtf","gg","ez","pog","poggers","kappa","monka","pepe","feels","good","bad","nice","love","hate"}
+STOPWORDS = {"the","a","an","and","or","but","in","on","at","to","for","of","with","is","are","was","were","be","been","being","have","has","had","do","does","did","will","would","could","should","can","this","that","these","those","i","you","he","she","it","we","they","me","him","her","us","them","my","your","his","her","its","our","their","so","just","like","really","very","much","now","here","there","when","where","why","how","all","any","some","no","not","yes","yeah"}
+
+# Common Twitch emotes/commands to exclude from sentiment analysis
+TWITCH_EMOTES = {"mods", "kurwa", "pog", "poggers", "kappa", "monka", "pepe", "feels",
+                 "lul", "omegalul", "keks", "widepeepo", "dendi", "ayaya", "dentge",
+                 "xdd", "prayge", "monkas", "sadge", "pepelaugh", "pepela",
+                 "weirdchamp", "pogchamp", "pogyou", "page", "weeg", "snark",
+                 "susge", "icant", "goodone", "catjam", "rainbowpls", "kekw",
+                 "clap", "widepeepohappy", "peepohappy", "peeposad", "weirdginger"}
 
 def tokenize_words(text, min_len=3, ignore_words=None, ignore_mentions=True):
+    # Strip URLs before tokenization (P1)
+    text = re.sub(r'https?://\S+', '', text)
+    ignore_set = ignore_words or set()
+    if ignore_mentions:
+        # Filter @mentions before regex — split words, drop @-prefixed tokens (P0)
+        tokens = text.lower().split()
+        tokens = [t for t in tokens if not t.startswith('@')]
+        text = ' '.join(tokens)
     pattern = rf'\b[a-zA-Z]{{{min_len},}}\b'
     words = re.findall(pattern, text.lower())
-    ignore_set = ignore_words or set()
     result = []
     for w in words:
         if w in STOPWORDS:
             continue
-        if ignore_mentions and w.startswith('@'):
+        if w in TWITCH_EMOTES:
             continue
         if w in ignore_set:
             continue
@@ -60,14 +75,9 @@ def tokenize_words(text, min_len=3, ignore_words=None, ignore_mentions=True):
     return result
 
 def get_word_sentiment(word, sentence_score):
-    try:
-        res = sentiment_pipeline(word[:128])[0]
-        score = float(res["score"])
-        if res["label"].upper() == "NEGATIVE":
-            score = -score
-        return 0.7 * score + 0.3 * sentence_score
-    except:
-        return 0.0
+    # P4: No per-word pipeline call — reuse sentence-level score directly
+    # Single words don't carry reliable sentiment from distilbert
+    return sentence_score
 
 class SemanticSentimentTracker:
     def __init__(self, min_word_len=3, min_sentence_words=2, ignore_words=None, 
@@ -117,9 +127,10 @@ class SemanticSentimentTracker:
                 for cluster in self.clusters:
                     if float(util.cos_sim(emb, cluster["embedding"])) >= self.word_threshold:
                         age = ts - cluster["last_ts"]
-                        freshness = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
-                        weighted = abs(word_score) * freshness
-                        cluster["total_score"] += weighted
+                        decay = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
+                        # P2: Decay stored scores before accumulating
+                        cluster["total_score"] = cluster["total_score"] * decay + abs(word_score)
+                        cluster["net_score"] = cluster["net_score"] * decay + word_score
                         cluster["count"] += 1
                         cluster["last_ts"] = ts
                         if word not in cluster["members"]:
@@ -131,6 +142,7 @@ class SemanticSentimentTracker:
                 if not matched:
                     self.clusters.append({
                         "rep_word": word, "embedding": emb, "total_score": abs(word_score),
+                        "net_score": word_score,
                         "count": 1, "last_ts": ts, "members": [word], "best_sentence": text
                     })
 
@@ -140,8 +152,10 @@ class SemanticSentimentTracker:
             for scluster in self.sentence_clusters:
                 if float(util.cos_sim(sent_emb, scluster["embedding"])) >= self.sent_threshold:
                     age = ts - scluster["last_ts"]
-                    freshness = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
-                    scluster["total_score"] += abs(sent_score) * freshness
+                    decay = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
+                    # P2: Decay stored scores before accumulating
+                    scluster["total_score"] = scluster["total_score"] * decay + abs(sent_score)
+                    scluster["net_score"] = scluster["net_score"] * decay + sent_score
                     scluster["count"] += 1
                     scluster["last_ts"] = ts
                     if len(scluster["examples"]) < 3:
@@ -152,6 +166,7 @@ class SemanticSentimentTracker:
                 self.sentence_clusters.append({
                     "embedding": sent_emb,
                     "total_score": abs(sent_score),
+                    "net_score": sent_score,
                     "count": 1,
                     "last_ts": ts,
                     "examples": [text]
@@ -160,6 +175,20 @@ class SemanticSentimentTracker:
             cutoff = ts - SLIDING_WINDOW_SECONDS
             self.clusters = [c for c in self.clusters if c["last_ts"] >= cutoff]
             self.sentence_clusters = [c for c in self.sentence_clusters if c["last_ts"] >= cutoff]
+
+    def _polarity_emoji(self, net_score):
+        if net_score > 0.1:
+            return "➕"
+        elif net_score < -0.1:
+            return "➖"
+        return "⚪"
+
+    def _polarity_label(self, net_score):
+        if net_score > 0.1:
+            return "pos"
+        elif net_score < -0.1:
+            return "neg"
+        return "neu"
 
     def get_top_word_sentiments(self, n=TOP_N):
         now = time.time()
@@ -176,6 +205,8 @@ class SemanticSentimentTracker:
                     "count": c["count"],
                     "members": ", ".join(c["members"][:5]),
                     "sentence": c.get("best_sentence", c["rep_word"]),
+                    "polarity": self._polarity_emoji(c["net_score"]),
+                    "polarity_label": self._polarity_label(c["net_score"]),
                     "freshness": "🆕" if age < 30 else "  ",
                     "last_seen": datetime.fromtimestamp(c["last_ts"]).strftime("%H:%M:%S")
                 })
@@ -197,6 +228,8 @@ class SemanticSentimentTracker:
                     "count": c["count"],
                     "members": "",
                     "sentence": c["examples"][0],
+                    "polarity": self._polarity_emoji(c["net_score"]),
+                    "polarity_label": self._polarity_label(c["net_score"]),
                     "freshness": "🆕" if age < 30 else "  ",
                     "last_seen": datetime.fromtimestamp(c["last_ts"]).strftime("%H:%M:%S")
                 })
@@ -214,7 +247,7 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
 
     nick = "justinfan" + str(int(time.time()) % 100000)
     if not token.startswith("oauth:"):
-        token = "oauth:\" + token
+        token = "oauth:" + token
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.settimeout(300)
@@ -245,19 +278,22 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
                 print("  (No word clusters yet)")
             else:
                 for i, s in enumerate(word_top, 1):
-                    print(f"{i:2}. {s['freshness']} {s['sentiment']:<16} score={s['score']:.3f} count={s['count']}")
-                    print(f"    Sentence: \"{s['sentence']}\"  | members=[{s['members']}]")
+                    print(f"{i:2}. {s['freshness']}{s['polarity']} {s['sentiment']:<16} score={s['score']:.3f} count={s['count']:>3}  ({s['polarity_label']})")
+                    # Compact: truncate long sentences to 80 chars
+                    ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
+                    print(f"     \"{ex}\"  members=[{s['members']}]")
 
             print(f"\n=== TOP {TOP_N} SIMILAR SENTENCE CLUSTERS ===")
             if not sent_top:
                 print("  (No similar sentence groups yet)")
             else:
                 for i, s in enumerate(sent_top, 1):
-                    print(f"{i:2}. {s['freshness']} score={s['score']:.3f} count={s['count']}  last={s['last_seen']}")
-                    print(f"    \"{s['sentence']}\"")
+                    ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
+                    print(f"{i:2}. {s['freshness']}{s['polarity']} score={s['score']:.3f} count={s['count']:>3}  last={s['last_seen']}  ({s['polarity_label']})")
+                    print(f"     \"{ex}\"")
 
-            print(f"\nTotal messages: {msg_count} | Word clusters: {w_clusters} | Sentence clusters: {s_clusters}")
-            print("=" * 95)
+            print(f"\nMessages: {msg_count} | Word clusters: {w_clusters} | Sentence clusters: {s_clusters}")
+            print("─" * 95)
 
     threading.Thread(target=printer, daemon=True).start()
 
