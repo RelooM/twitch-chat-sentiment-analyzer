@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """
-Twitch Real-Time Chat Sentiment Analyzer v2.2
+Twitch Real-Time Chat Sentiment Analyzer v2.3
 - Per-word analysis + semantic embedding clustering
 - Sentence-level semantic clustering
 - Configurable embedding models and similarity thresholds
 - Toggleable @mention and !command filtering
 - IRC runner in separate multiprocessing process for true isolation
-- Uses multiprocessing.Queue for message passing
+- Uses bounded multiprocessing.Queue for message passing with back-pressure
+- Configurable decay half-life
+- Regex-based ignore filter
 - Graceful shutdown via sentinel
 """
 
@@ -18,7 +20,7 @@ import argparse
 import json
 import os
 from datetime import datetime
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, Value
 import torch
 from threading import Lock, Event, Thread
 from sentence_transformers import SentenceTransformer, util
@@ -30,7 +32,8 @@ IRC_PORT = 6667
 PING_INTERVAL = 60
 TOP_N = 10
 SLIDING_WINDOW_SECONDS = 300
-DECAY_HALF_LIFE_SECONDS = 45
+DEFAULT_DECAY_HALF_LIFE_SECONDS = 45
+QUEUE_MAXSIZE = 1000  # maximum number of messages buffered in queue
 
 # Defaults that can be overridden by CLI args
 DEFAULT_WORD_SIMILARITY_THRESHOLD = 0.72
@@ -98,16 +101,19 @@ def get_word_sentiment(word, sentence_score):
 class SemanticSentimentTracker:
     def __init__(self, min_word_len=3, min_sentence_words=2, ignore_words=None,
                  word_threshold=DEFAULT_WORD_SIMILARITY_THRESHOLD,
-                 sent_threshold=DEFAULT_SENTENCE_SIMILARITY_THRESHOLD):
+                 sent_threshold=DEFAULT_SENTENCE_SIMILARITY_THRESHOLD,
+                 decay_half_life=DEFAULT_DECAY_HALF_LIFE_SECONDS):
         self.clusters = []
         self.sentence_clusters = []
         self.lock = Lock()
         self.message_count = 0
+        self.ignored_regex_count = 0  # count of messages dropped by regex
         self.min_word_len = min_word_len
         self.min_sentence_words = min_sentence_words
         self.ignore_words = set(ignore_words) if ignore_words else set()
         self.word_threshold = float(word_threshold)
         self.sent_threshold = float(sent_threshold)
+        self.decay_half_life = float(decay_half_life)
         # For variable refresh rate
         self.messages_at_last_print = 0
 
@@ -118,12 +124,22 @@ class SemanticSentimentTracker:
             return torch.zeros(384)
         return embed_model.encode(text, convert_to_tensor=True, show_progress_bar=False)
 
-    def add_message(self, text, ts=None, ignore_mentions=True, ignore_commands=True):
+    def add_message(self, text, ts=None, ignore_mentions=True, ignore_commands=True, ignore_regex=None):
         if ts is None:
             ts = time.time()
 
         if ignore_commands and text.strip().startswith('!'):
             return
+
+        # Apply regex ignore if provided
+        if ignore_regex is not None:
+            try:
+                if re.search(ignore_regex, text):
+                    with self.lock:
+                        self.ignored_regex_count += 1
+                    return
+            except re.error:
+                pass  # invalid regex, ignore
 
         try:
             sent_res = sentiment_pipeline(text[:512])[0]
@@ -144,7 +160,7 @@ class SemanticSentimentTracker:
             for scluster in self.sentence_clusters:
                 if float(util.cos_sim(sent_emb, scluster["embedding"])) >= self.sent_threshold:
                     age = ts - scluster["last_ts"]
-                    decay = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
+                    decay = 2 ** (-age / self.decay_half_life)
                     # P2: Decay stored scores before accumulating
                     scluster["total_score"] = scluster["total_score"] * decay + abs(sent_score)
                     scluster["net_score"] = scluster["net_score"] * decay + sent_score
@@ -174,10 +190,12 @@ class SemanticSentimentTracker:
                     for cluster in self.clusters:
                         if float(util.cos_sim(emb, cluster["embedding"])) >= self.word_threshold:
                             age = ts - cluster["last_ts"]
-                            decay = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
+                            decay = 2 ** (-age / self.decay_half_life)
                             # P2: Decay stored scores before accumulating
                             cluster["total_score"] = cluster["total_score"] * decay + abs(word_score)
                             cluster["net_score"] = cluster["net_score"] * decay + word_score
+                            count_before = cluster["count"]
+                            # Note: we don't need count_before
                             cluster["count"] += 1
                             cluster["last_ts"] = ts
                             if word not in cluster["members"]:
@@ -224,7 +242,7 @@ class SemanticSentimentTracker:
         with self.lock:
             for c in self.clusters:
                 age = now - c["last_ts"]
-                freshness = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
+                freshness = 2 ** (-age / self.decay_half_life)
                 final_score = c["total_score"] * freshness
                 ranked.append({
                     "type": "word",
@@ -247,7 +265,7 @@ class SemanticSentimentTracker:
         with self.lock:
             for c in self.sentence_clusters:
                 age = now - c["last_ts"]
-                freshness = 2 ** (-age / DECAY_HALF_LIFE_SECONDS)
+                freshness = 2 ** (-age / self.decay_half_life)
                 final_score = c["total_score"] * freshness
                 ranked.append({
                     "type": "sentence",
@@ -266,13 +284,15 @@ class SemanticSentimentTracker:
 
     def status(self):
         with self.lock:
-            return self.message_count, len(self.clusters), len(self.sentence_clusters)
+            return self.message_count, len(self.clusters), len(self.sentence_clusters), self.ignored_regex_count
 
 def irc_reader_process(channel, token, ignore_users_set, ignore_words_set,
-                       ignore_mentions, ignore_commands, q: Queue):
+                       ignore_mentions, ignore_commands, ignore_regex, q: Queue, dropped_counter: Value):
     """
     Runs in a separate process: reads from Twitch IRC and puts raw messages into the queue.
     Never performs heavy NLP work.
+    Implements back-pressure: if queue is full, blocks until space available.
+    Tracks dropped messages due to queue full (if timeout) via dropped_counter.
     """
     # Build nick
     nick = "justinfan" + str(int(time.time()) % 100000)
@@ -316,8 +336,22 @@ def irc_reader_process(channel, token, ignore_users_set, ignore_words_set,
                         continue
                     msg = match.group(2).strip()
                     if msg:
-                        # Put a dict with minimal info
-                        q.put({"text": msg, "ts": time.time(), "user": user})
+                        # Apply regex ignore if provided
+                        if ignore_regex is not None:
+                            try:
+                                if re.search(ignore_regex, msg):
+                                    with dropped_counter.get_lock():
+                                        dropped_counter.value += 1
+                                    continue
+                            except re.error:
+                                pass  # invalid regex, ignore
+                        # Put with blocking wait for space (simple back-pressure)
+                        try:
+                            q.put({"text": msg, "ts": time.time(), "user": user}, block=True, timeout=1.0)
+                        except Exception:
+                            # If put fails after timeout, count as dropped
+                            with dropped_counter.get_lock():
+                                dropped_counter.value += 1
             if time.time() - last_ping > PING_INTERVAL:
                 sock.send(b"PING :tmi.twitch.tv\\r\\n")
                 last_ping = time.time()
@@ -343,6 +377,7 @@ def printer_process(tracker, stop_event):
         with tracker.lock:
             current_count = tracker.message_count
             new_messages = current_count - tracker.messages_at_last_print
+            ignored_regex = tracker.ignored_regex_count
         if new_messages >= 10:
             pass
         elif new_messages >= 5:
@@ -355,7 +390,7 @@ def printer_process(tracker, stop_event):
             time.sleep(3)
         word_top = tracker.get_top_word_sentiments()
         sent_top = tracker.get_top_sentence_sentiments()
-        msg_count, w_clusters, s_clusters = tracker.status()
+        msg_count, w_clusters, s_clusters, ignored = tracker.status()
         with tracker.lock:
             tracker.messages_at_last_print = tracker.message_count
         out_lines = []
@@ -375,12 +410,13 @@ def printer_process(tracker, stop_event):
                 ex = s['sentence'][:80] + ("..." if len(s['sentence']) > 80 else "")
                 out_lines.append(f"{i:2}. {s['freshness']}{s['polarity']} score={s['score']:.3f} count={s['count']:>3}  last={s['last_seen']}  ({s['polarity_label']})")
                 out_lines.append(f"     \"{ex}\"")
-        out_lines.append(f"\nMessages: {msg_count} | Word clusters: {w_clusters} | Sentence clusters: {s_clusters}")
+        out_lines.append(f"\nMessages: {msg_count} | Word clusters: {w_clusters} | Sentence clusters: {s_clusters} | Regex ignored: {ignored}")
         out_lines.append("-" * 95)
         print("\n".join(out_lines), flush=True)
 
 def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_words, ignore_words,
-                       ignore_mentions, ignore_commands, word_threshold, sent_threshold):
+                       ignore_mentions, ignore_commands, word_threshold, sent_threshold,
+                       decay_half_life, ignore_regex):
     ignore_users_set = {u.lower().strip() for u in ignore_users} if ignore_users else set()
     ignore_words_set = {w.lower().strip() for w in ignore_words} if ignore_words else set()
 
@@ -390,14 +426,20 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
         raise RuntimeError("Models not loaded. Call load_models() first.")
 
     tracker = SemanticSentimentTracker(min_word_len, min_sentence_words, frozenset(ignore_words_set),
-                                       float(word_threshold), float(sent_threshold))
+                                       float(word_threshold), float(sent_threshold),
+                                       float(decay_half_life))
 
     # Setup multiprocessing queue for IRC -> main communication
-    q = Queue()
+    q = Queue(maxsize=QUEUE_MAXSIZE)
+    # Shared counter for dropped messages due to queue full
+    from multiprocessing import Value
+    dropped_counter = Value('i', 0)
+
     # Start IRC reader process
     irc_proc = Process(target=irc_reader_process,
                        args=(channel, token, frozenset(ignore_users_set), frozenset(ignore_words_set),
-                             bool(ignore_mentions), bool(ignore_commands), q),
+                             bool(ignore_mentions), bool(ignore_commands), 
+                             ignore_regex, q, dropped_counter),
                        daemon=True)
     irc_proc.start()
 
@@ -424,6 +466,11 @@ def connect_and_listen(channel, token, ignore_users, min_word_len, min_sentence_
         if irc_proc.is_alive():
             irc_proc.terminate()
             irc_proc.join()
+        # Report dropped stats
+        with dropped_counter.get_lock():
+            dropped = dropped_counter.value
+        if dropped:
+            print(f"[INFO] Dropped {dropped} messages due to queue full or regex filter.", flush=True)
         print("[INFO] Disconnected.", flush=True)
 
 def main():
@@ -441,6 +488,10 @@ def main():
                         help=f"Similarity threshold for word clustering (default: {DEFAULT_WORD_SIMILARITY_THRESHOLD})")
     parser.add_argument("--sent-threshold", type=float, default=DEFAULT_SENTENCE_SIMILARITY_THRESHOLD,
                         help=f"Similarity threshold for sentence clustering (default: {DEFAULT_SENTENCE_SIMILARITY_THRESHOLD})")
+    parser.add_argument("--decay-halflife", type=float, default=DEFAULT_DECAY_HALF_LIFE_SECONDS,
+                        help=f"Half-life for score decay in seconds (default: {DEFAULT_DECAY_HALF_LIFE_SECONDS})")
+    parser.add_argument("--ignore-regex", type=str, default=None,
+                        help="Regex pattern to ignore matching messages (default: None)")
     parser.add_argument("--ignore-mentions", action="store_true", default=True,
                         help="Ignore words starting with @ (default: True)")
     parser.add_argument("--no-ignore-mentions", dest="ignore_mentions", action="store_false",
@@ -460,7 +511,9 @@ def main():
     connect_and_listen(
         args.channel.lower(), args.token, ignore_users,
         args.min_word_len, args.min_sentence_words, ignore_words,
-        args.ignore_mentions, args.ignore_commands, args.word_threshold, args.sent_threshold
+        args.ignore_mentions, args.ignore_commands, 
+        args.word_threshold, args.sent_threshold,
+        args.decay_halflife, args.ignore_regex
     )
 
 if __name__ == "__main__":
