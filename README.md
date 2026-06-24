@@ -98,13 +98,28 @@ python3 twitch_sentiment_tool.py \
 
 ## Output
 
-The tool displays two live-updating sections:
+The tool displays two live-updating sections every 8 seconds:
 
 ### Word Clusters
-Top semantically grouped words with representative sentences.
+Top semantically grouped words with sentiment polarity, freshness indicators, and representative sentences.
+- **➕** = positive sentiment · **➖** = negative sentiment · **⚪** = neutral
+- **🆕** = seen in the last 30 seconds
+- Score decays exponentially with time — recent chat ranks higher
 
 ### Similar Sentence Clusters
-Groups of nearly identical or highly similar chat messages (e.g. repeated hype, complaints, etc.).
+Groups of nearly identical or highly similar chat messages (e.g. repeated hype, complaints, etc.), with polarity labels.
+
+### Example Output
+```
+ 1. 🆕➖ considering      score=10.597 count= 15  (neg)
+     "@minion_laughing_guy we gotta ponder the REAL things yk? Considering"  members=[considering]
+ 2. 🆕➕ holy             score=1.316 count=  2  (pos)
+     "HOLY ONER Susge"  members=[holy]
+ 3. 🆕➖ bard             score=1.578 count=  3  (neg)
+     "Considering BARD IS INTING I JUST CANT PROVE IT Considering"  members=[bard]
+
+Messages: 18 | Word clusters: 47 | Sentence clusters: 17
+```
 
 ## How It Works
 
